@@ -3,6 +3,7 @@ Nova CloudComfyUI - 云端 AI 绘图插件
 默认通过 Node undici 桥接请求云端接口，Python 路径仅保留作兼容/兜底逻辑
 """
 
+import asyncio
 import base64
 import json
 import random
@@ -73,6 +74,8 @@ class NovaCloudComfyUI(Star):
         self._user_last_request: dict[str, float] = {}
         self._processing_users: set[str] = set()
         self._client: httpx.AsyncClient | None = None
+        self._moderation_client: httpx.AsyncClient | None = None
+        self._moderation_credential_index = 0
         self._base_url: str = ""
         self._api_key: str = ""
         self._proxy_url: str = ""
@@ -114,17 +117,28 @@ class NovaCloudComfyUI(Star):
         """初始化插件"""
         timeout = httpx.Timeout(self.config.get("timeout", 180))
         proxy_url = str(self.config.get("proxy_url", "") or "").strip()
-        transport = httpx.AsyncHTTPTransport(proxy=proxy_url) if proxy_url else None
+        request_transport = (
+            httpx.AsyncHTTPTransport(proxy=proxy_url) if proxy_url else None
+        )
 
         self._client = httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
-            transport=transport,
+            transport=request_transport,
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
                 "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             }
+        )
+        moderation_timeout = max(1, int(self.config.get("moderation_timeout", 10)))
+        moderation_transport = (
+            httpx.AsyncHTTPTransport(proxy=proxy_url) if proxy_url else None
+        )
+        self._moderation_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(moderation_timeout),
+            follow_redirects=True,
+            transport=moderation_transport,
         )
 
         self._base_url = self.config.get("base_url", "https://sd.exacg.cc").strip().rstrip("/")
@@ -145,6 +159,9 @@ class NovaCloudComfyUI(Star):
         if self._client:
             await self._client.aclose()
             self._client = None
+        if self._moderation_client:
+            await self._moderation_client.aclose()
+            self._moderation_client = None
         logger.info("[NovaCloudComfyUI] 插件已终止")
 
     def _parse_resolution(self, resolution: str | None) -> tuple[int, int]:
@@ -554,6 +571,125 @@ class NovaCloudComfyUI(Star):
         logger.info(f"[NovaCloudComfyUI] 图片已转换为 PNG: {target_path}")
         return target_path
 
+    def _get_moderation_credentials(self) -> list[tuple[str, str]]:
+        credentials = []
+        for item in self.config.get("sightengine_credentials", []):
+            api_user, separator, api_secret = str(item).partition(":")
+            if separator and api_user.strip() and api_secret.strip():
+                credentials.append((api_user.strip(), api_secret.strip()))
+        return credentials
+
+    def _next_moderation_credential(self) -> tuple[str, str]:
+        credentials = self._get_moderation_credentials()
+        if not credentials:
+            raise RuntimeError("未配置 Sightengine 凭据")
+        credential = credentials[self._moderation_credential_index % len(credentials)]
+        self._moderation_credential_index = (
+            self._moderation_credential_index + 1
+        ) % len(credentials)
+        return credential
+
+    async def _is_sensitive_image(self, image_path: Path) -> bool:
+        api_url = str(
+            self.config.get(
+                "moderation_api_url",
+                "https://api.sightengine.com/1.0/check.json",
+            )
+        ).strip()
+        retries = max(0, int(self.config.get("moderation_retries", 2)))
+        threshold = min(
+            1.0,
+            max(0.0, float(self.config.get("moderation_threshold", 0.8))),
+        )
+
+        for attempt in range(1, retries + 2):
+            credential_label = "unavailable"
+            try:
+                api_user, api_secret = self._next_moderation_credential()
+                credential_label = api_user
+                if self._moderation_client is None:
+                    raise RuntimeError("图片审核客户端未初始化")
+                response = await self._moderation_client.post(
+                    api_url,
+                    data={
+                        "models": "nudity-2.1",
+                        "api_user": api_user,
+                        "api_secret": api_secret,
+                    },
+                    files={
+                        "media": (
+                            image_path.name,
+                            image_path.read_bytes(),
+                            "application/octet-stream",
+                        )
+                    },
+                )
+                if response.status_code != 200:
+                    raise RuntimeError(f"HTTP {response.status_code}")
+                result = response.json()
+                if not isinstance(result, dict) or result.get("status") != "success":
+                    error = result.get("error", {}) if isinstance(result, dict) else {}
+                    raise RuntimeError(
+                        str(error.get("message") or "Sightengine 响应状态异常")
+                    )
+                nudity = result.get("nudity")
+                if not isinstance(nudity, dict):
+                    raise RuntimeError("响应缺少 nudity 数据")
+
+                scores = {
+                    key: float(nudity.get(key, 0.0))
+                    for key in ("sexual_activity", "sexual_display", "erotica")
+                }
+                max_score = max(scores.values())
+                is_sensitive = max_score >= threshold
+                logger.info(
+                    f"[NovaCloudComfyUI] 图片审核完成: sensitive={is_sensitive}, "
+                    f"score={max_score:.3f}, threshold={threshold:.3f}, "
+                    f"attempt={attempt}/{retries + 1}, credential={credential_label}"
+                )
+                return is_sensitive
+            except (
+                httpx.HTTPError,
+                asyncio.TimeoutError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as e:
+                logger.warning(
+                    f"[NovaCloudComfyUI] 图片审核失败: attempt={attempt}/{retries + 1}, "
+                    f"credential={credential_label}, error={type(e).__name__}: {e}"
+                )
+
+        logger.warning("[NovaCloudComfyUI] 图片审核重试全部失败，安全兜底为合并转发")
+        return True
+
+    @staticmethod
+    def _clean_model_name(model_name: Any) -> str:
+        cleaned = re.sub(r"^(?:\s*\[[^\]]*\])+\s*", "", str(model_name or "未知"))
+        return cleaned.strip() or "未知"
+
+    @classmethod
+    def _build_result_summary(cls, result: dict[str, Any]) -> str:
+        model_name = cls._clean_model_name(result.get("model_name", "未知"))
+        return (
+            "绘图结果\n"
+            f"模型: {model_name}\n"
+            f"尺寸: {result.get('width')}x{result.get('height')}"
+        )
+
+    @staticmethod
+    def _format_user_error(error: Exception) -> str:
+        message = str(error)
+        status_match = re.search(
+            r"(?:请求失败\s*\(|HTTP\s*)([1-5]\d{2})",
+            message,
+            re.IGNORECASE,
+        )
+        if status_match:
+            return status_match.group(1)
+        return message[:200]
+
     async def _send_image_result(
         self,
         event: AstrMessageEvent,
@@ -562,6 +698,12 @@ class NovaCloudComfyUI(Star):
         use_forward: bool,
         summary_text: str,
     ) -> None:
+        if (
+            not use_forward
+            and bool(self.config.get("smart_forward_sensitive_images", False))
+        ):
+            use_forward = await self._is_sensitive_image(image_path)
+
         if not use_forward:
             await event.send(event.chain_result([Image.fromFileSystem(str(image_path))]))
             return
@@ -907,20 +1049,6 @@ class NovaCloudComfyUI(Star):
             except Exception as e:
                 logger.warning(f"[NovaCloudComfyUI] 编辑结果转 PNG 失败，继续发送原图: {e}")
 
-        send_image_as_forward = bool(self.config.get("send_image_as_forward", False))
-        if auto_send:
-            await self._send_image_result(
-                event,
-                image_path,
-                use_forward=send_image_as_forward,
-                summary_text=(
-                    f"绘图结果\n"
-                    f"模型: {result.get('model_name', '未知')}\n"
-                    f"尺寸: {width}x{height}\n"
-                    f"积分: {result.get('points_used', '?')}/{result.get('remaining_points', '?')}"
-                ),
-            )
-
         real_width, real_height = self._read_image_size(image_path)
 
         result["image_path"] = str(image_path)
@@ -933,6 +1061,15 @@ class NovaCloudComfyUI(Star):
         result["actual_prompt"] = prompt_text
         result["actual_resolution"] = actual_resolution
         result["actual_seed"] = actual_seed
+
+        if auto_send:
+            await self._send_image_result(
+                event,
+                image_path,
+                use_forward=bool(self.config.get("send_image_as_forward", False)),
+                summary_text=self._build_result_summary(result),
+            )
+
         return result
 
     @filter.llm_tool()
@@ -964,16 +1101,10 @@ class NovaCloudComfyUI(Star):
                 event=event,
                 prompt=prompt,
             )
-            return (
-                f"图片生成完成！\n"
-                f"- 模型: {result.get('model_name', '未知')}\n"
-                f"- 尺寸: {result.get('width')}x{result.get('height')}\n"
-                f"- 消耗/剩余积分: {result.get('points_used', '?')}/{result.get('remaining_points', '?')}\n"
-                f"- Seed: {result.get('actual_seed', '?')}"
-            )
+            return self._build_result_summary(result)
         except Exception as e:
             logger.error(f"[NovaCloudComfyUI] 主动文生图失败: {e}")
-            return f"生成图片失败: {str(e)}"
+            return f"生成图片失败: {self._format_user_error(e)}"
         finally:
             self._processing_users.discard(request_id)
 
@@ -1020,16 +1151,10 @@ class NovaCloudComfyUI(Star):
                 image_source=actual_image_source,
                 force_edit=True,
             )
-            return (
-                f"图片编辑完成！\n"
-                f"- 模型: {result.get('model_name', '未知')}\n"
-                f"- 尺寸: {result.get('width')}x{result.get('height')}\n"
-                f"- 消耗/剩余积分: {result.get('points_used', '?')}/{result.get('remaining_points', '?')}\n"
-                f"- Seed: {result.get('actual_seed', '?')}"
-            )
+            return self._build_result_summary(result)
         except Exception as e:
             logger.error(f"[NovaCloudComfyUI] 主动图编辑失败: {e}")
-            return f"编辑图片失败: {str(e)}"
+            return f"编辑图片失败: {self._format_user_error(e)}"
         finally:
             self._processing_users.discard(request_id)
 
@@ -1128,12 +1253,7 @@ class NovaCloudComfyUI(Star):
                     event,
                     Path(image_path),
                     use_forward=bool(self.config.get("send_image_as_forward", False)),
-                    summary_text=(
-                        f"绘图结果\n"
-                        f"模型: {result.get('model_name', '未知')}\n"
-                        f"尺寸: {result.get('width')}x{result.get('height')}\n"
-                        f"积分: {result.get('points_used', '?')}/{result.get('remaining_points', '?')}"
-                    ),
+                    summary_text=self._build_result_summary(result),
                 )
                 yield event.plain_result("").stop_event()
             else:
@@ -1141,7 +1261,9 @@ class NovaCloudComfyUI(Star):
 
         except Exception as e:
             logger.error(f"[NovaCloudComfyUI] 指令生图失败: {repr(e)}")
-            yield event.plain_result(f"生成图片失败: {repr(e)}").stop_event()
+            yield event.plain_result(
+                f"生成图片失败: {self._format_user_error(e)}"
+            ).stop_event()
 
         finally:
             self._processing_users.discard(request_id)

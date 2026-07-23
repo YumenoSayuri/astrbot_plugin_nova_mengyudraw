@@ -43,10 +43,62 @@
         "default": true
     },
     "send_image_as_forward": {
-        "description": "图片结果以合并转发发送",
-        "hint": "开启后，生成或改图结果不会直接裸图发送，而是以合并转发节点方式发出，适合规避群内直接露出敏感图片",
+        "description": "强制全部图片合并转发",
+        "hint": "开启后不进行智能区分，所有生成或改图结果都以合并转发发送；优先级高于智能漏点图转发",
         "type": "bool",
         "default": false
+    },
+    "smart_forward_sensitive_images": {
+        "description": "智能合并转发漏点图片",
+        "hint": "开启后通过 Sightengine nudity-2.1 审核本地成图；仅核心裸露分达到阈值时合并转发，普通、低胸或内衣图片仍直接发送。审核重试全部失败时安全兜底为合并转发",
+        "type": "bool",
+        "default": false
+    },
+    "sightengine_credentials": {
+        "description": "Sightengine 审核凭据",
+        "hint": "支持多组轮询，每行格式 api_user:api_secret。审核失败重试时会自动切换下一组凭据",
+        "type": "list",
+        "default": [],
+        "obvious_hint": true
+    },
+    "moderation_api_url": {
+        "description": "Sightengine 审核接口地址",
+        "hint": "通常无需修改，插件通过文件流上传本地成图",
+        "type": "string",
+        "default": "https://api.sightengine.com/1.0/check.json"
+    },
+    "moderation_threshold": {
+        "description": "核心裸露判定阈值",
+        "hint": "取 sexual_activity、sexual_display、erotica 三项最大值，达到此阈值时合并转发；不会因低胸、内衣等 suggestive 分类单独触发",
+        "type": "float",
+        "slider": {
+            "min": 0.1,
+            "max": 1.0,
+            "step": 0.05
+        },
+        "default": 0.8
+    },
+    "moderation_timeout": {
+        "description": "单次图片审核超时（秒）",
+        "hint": "每次请求 Sightengine 的最长等待时间",
+        "type": "int",
+        "slider": {
+            "min": 1,
+            "max": 60,
+            "step": 1
+        },
+        "default": 10
+    },
+    "moderation_retries": {
+        "description": "图片审核失败重试次数",
+        "hint": "不包含首次请求。例如设为 2 时最多请求 3 次，每次自动轮换下一组凭据；全部失败后自动合并转发",
+        "type": "int",
+        "slider": {
+            "min": 0,
+            "max": 10,
+            "step": 1
+        },
+        "default": 2
     },
     "default_resolution": {
         "description": "默认生成图片分辨率",

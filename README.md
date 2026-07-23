@@ -15,7 +15,10 @@ CloudComfyUI 插件默认通过 Node undici 桥接调用云端绘图接口，并
 - 命令检测到“有图上下文”时自动切换默认编辑模型
 - 改图未指定分辨率时可按面板开关分别自动缩小超限原图或自动放大小图
 - 编辑结果发送前可自动转 PNG，默认开启，兼容旧版 PC QQ
-- 图片结果可按面板开关改为合并转发发送，避免直接裸图显示
+- 支持强制全部图片合并转发，或通过 Sightengine 智能识别漏点图后仅折叠敏感结果
+- 支持多组 Sightengine 凭据轮询，审核重试时自动切换下一组
+- 转发摘要仅显示清洗后的模型名与真实成图尺寸
+- 用户可见的 HTTP 错误仅显示状态码，详细内容保留在 AstrBot 日志
 - prompt 内解析并删除 `modelX`
 - prompt 内解析并删除 `cfgX`
 - prompt 内解析并删除 `stepsX`
@@ -27,6 +30,49 @@ CloudComfyUI 插件默认通过 Node undici 桥接调用云端绘图接口，并
 - 命令成功时默认只发图，成功摘要写日志
 - 记录真实成图尺寸，避免请求尺寸与实际输出不一致时误报
 - Cloudflare Worker 中转兼容
+
+---
+
+## v1.5.0 更新说明
+
+### 智能漏点图片合并转发
+
+面板新增：
+
+- `smart_forward_sensitive_images`：开启 Sightengine 智能审核
+- `sightengine_credentials`：多组凭据列表，每行格式 `api_user:api_secret`
+- `moderation_threshold`：核心裸露阈值，默认 `0.8`
+- `moderation_timeout`：单次审核超时，默认 `10` 秒
+- `moderation_retries`：审核失败重试次数，默认 `2`
+
+插件使用 Sightengine `nudity-2.1` 本地文件上传审核，判定分数取 `sexual_activity`、`sexual_display`、`erotica` 三项最大值。低胸、内衣等仅命中 `suggestive` 的图片不会单独触发合并转发。审核重试全部失败时安全兜底为合并转发。
+
+多组凭据会按请求轮询，重试时继续切换下一组。示例：
+
+```text
+1044950338:此处填写对应的 api_secret
+另一组 api_user:另一组 api_secret
+```
+
+`send_image_as_forward=true` 时会强制所有图片合并转发，优先级高于智能审核。
+
+### 精简结果与错误提示
+
+合并转发摘要和 LLM 工具成功返回统一为：
+
+```text
+绘图结果
+模型: Wainsfw illustrious v16
+尺寸: 832x1216
+```
+
+模型名前置的 `[全新模型]`、`[新服开放]` 等方括号标签会自动移除，不再显示积分与 Seed。HTTP 错误对用户仅保留状态码，例如：
+
+```text
+生成图片失败: 504
+```
+
+完整错误仍写入 AstrBot 日志用于排障。
 
 ---
 
@@ -60,7 +106,7 @@ CloudComfyUI 插件默认通过 Node undici 桥接调用云端绘图接口，并
 
 ---
 
-### 新增 edit 结果转 PNG 与合并转发发送开关
+### 旧版新增 edit 结果转 PNG 与强制合并转发开关
 
 本次新增两个新的面板配置项：
 
@@ -70,7 +116,7 @@ CloudComfyUI 插件默认通过 Node undici 桥接调用云端绘图接口，并
 默认值：
 
 - 编辑结果发送前自动转 PNG：`true`
-- 图片结果以合并转发发送：`false`
+- 强制全部图片合并转发：`false`
 
 行为说明：
 
@@ -79,7 +125,7 @@ CloudComfyUI 插件默认通过 Node undici 桥接调用云端绘图接口，并
    - 会在发送前优先将编辑结果转换为 `PNG`
    - 用于提升旧版 PC QQ 对改图结果的兼容性
 
-2. 当 `send_image_as_forward=true` 时：
+2. 当旧版强制开关 `send_image_as_forward=true` 时：
    - 图片结果不会直接裸图发送
    - 而是以合并转发节点方式发出
    - 节点中的图片内容使用 base64 图像数据构造，避免宿主机 Windows 路径与 NapCat 运行环境不一致时的跨系统文件访问问题
@@ -228,7 +274,11 @@ CloudComfyUI 插件默认通过 Node undici 桥接调用云端绘图接口，并
 - 编辑模型自动缩小超限原图：`true`
 - 编辑模型自动放大小图：`false`
 - 编辑结果发送前自动转 PNG：`true`
-- 图片结果以合并转发发送：`false`
+- 强制全部图片合并转发：`false`
+- 智能合并转发漏点图片：`false`
+- Sightengine 核心裸露阈值：`0.8`
+- Sightengine 审核超时：`10` 秒
+- Sightengine 审核失败重试：`2` 次
 - 默认 negative_prompt：使用面板配置
 - 默认代理：按面板配置
 - 默认 base_url：`https://sd.exacg.cc`
@@ -237,4 +287,4 @@ CloudComfyUI 插件默认通过 Node undici 桥接调用云端绘图接口，并
 
 ## 版本
 
-当前版本：[`v1.4.11`](AstrBot/data/plugins/astrbot_plugin_nova_cloudcomfyui/metadata.yaml:4)
+当前版本：`v1.5.0`
